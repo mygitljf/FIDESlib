@@ -2,6 +2,7 @@
 #include "CKKS/AccumulateBroadcast.cuh"
 #include "CKKS/ApproxModEval.cuh"
 #include "CKKS/Bootstrap.cuh"
+#include "CKKS/BootstrapPrecomputation.cuh"
 #include "CKKS/Ciphertext.cuh"
 #include "CKKS/Context.cuh"
 #include "CKKS/KeySwitchingKey.cuh"
@@ -236,6 +237,7 @@ void CryptoContextImpl<DCRTPoly>::LoadContext(const PublicKey<DCRTPoly>& publicK
     auto& c = std::any_cast<FIDESlib::CKKS::Context&>(this->gpu);
 
     auto& pkImpl = std::any_cast<const lbcrypto::PublicKey<lbcrypto::DCRTPoly>&>(publicKey->pimpl);
+    this->residency_public_key = publicKey;
 
     // Multiplicative key switching key.
     auto& keyMap = context->GetAllEvalMultKeys(); // lbcrypto::CryptoContextImpl<lbcrypto::DCRTPoly>::s_evalMultKeyMap;
@@ -244,6 +246,11 @@ void CryptoContextImpl<DCRTPoly>::LoadContext(const PublicKey<DCRTPoly>& publicK
         FIDESlib::CKKS::KeySwitchingKey eval_ksk(c);
         eval_ksk.Initialize(raw_eval_ksk);
         c->AddEvalKey(std::move(eval_ksk));
+    }
+    if (this->key_streaming) {
+        this->loaded = true;
+        this->PrepareKeyPhase(this->rotation_indexes, 0);
+        return;
     }
     // Rotational key switching keys.
     for (const auto& step : this->rotation_indexes) {
@@ -258,6 +265,85 @@ void CryptoContextImpl<DCRTPoly>::LoadContext(const PublicKey<DCRTPoly>& publicK
     }
 
     this->loaded = true;
+}
+
+void CryptoContextImpl<DCRTPoly>::SetKeyStreaming(bool enabled) {
+    if (this->loaded)
+        OPENFHE_THROW("SetKeyStreaming must be called before LoadContext");
+    if (enabled && (this->devices.size() != 1 || this->keyDist != fideslib::UNIFORM_TERNARY))
+        OPENFHE_THROW("Key streaming currently requires one device and UNIFORM_TERNARY");
+    this->key_streaming = enabled;
+}
+
+void CryptoContextImpl<DCRTPoly>::PrepareKeyPhase(const std::vector<int>& rotations, uint32_t bootstrapSlots) {
+    if (!this->key_streaming) return;
+    if (!this->loaded || !this->residency_public_key)
+        OPENFHE_THROW("PrepareKeyPhase requires a loaded context");
+    if (this->residency_phase_initialized && this->residency_phase_slots == bootstrapSlots &&
+        this->residency_phase_rotations == rotations) return;
+    this->Synchronize(); // No queued kernel may retain a reference to an evicted key.
+    auto& context = std::any_cast<lbcrypto::CryptoContext<lbcrypto::DCRTPoly>&>(this->cpu);
+    auto& c = std::any_cast<FIDESlib::CKKS::Context&>(this->gpu);
+    auto& pk = std::any_cast<const lbcrypto::PublicKey<lbcrypto::DCRTPoly>&>(this->residency_public_key->pimpl);
+    std::set<int> keep;
+    auto normalize = [&](int step) { const int width=c->N/2; return (step%width+width)%width; };
+    for (int step:rotations) if(step) keep.insert(normalize(step));
+    if (bootstrapSlots) {
+        if (std::find(this->slots_bootstrap.begin(),this->slots_bootstrap.end(),bootstrapSlots)==this->slots_bootstrap.end())
+            OPENFHE_THROW("Requested bootstrap has not been prepared on the host");
+        for (int step:FIDESlib::CKKS::GetBootstrapIndexes(context,bootstrapSlots,nullptr))
+            if(step) keep.insert(normalize(step));
+    }
+    const int conjugation=2*c->N-1;
+    auto& hostKeys=context->GetEvalAutomorphismKeyMap(pk->GetKeyTag());
+    if(hostKeys.count(conjugation)) keep.insert(conjugation);
+    // Check the complete host key set before evicting anything.
+    for(int step:keep) {
+        uint32_t index=step==conjugation?conjugation:FIDESlib::modpow(5,step,2*c->N);
+        if(!hostKeys.count(index)) OPENFHE_THROW("Requested rotation is absent from the host evaluation-key set");
+    }
+    auto& keys=c->precom.keys.at(pk->GetKeyTag()).rot_keys;
+    for(auto it=keys.begin();it!=keys.end();) {
+        if(!keep.count(it->first)){it=keys.erase(it);++this->residency_evictions;}
+        else ++it;
+    }
+    // Retain only this phase's bootstrap plaintexts; the CPU setup remains available.
+    for(auto it=c->precom.boot.begin();it!=c->precom.boot.end();) {
+        if(uint32_t(it->first)!=bootstrapSlots)it=c->precom.boot.erase(it);else ++it;
+    }
+    for(int step:keep) if(!keys.count(step)) {
+        auto raw=step==conjugation?FIDESlib::CKKS::GetConjugateKeySwitchKey(pk):FIDESlib::CKKS::GetRotationKeySwitchKey(pk,step);
+        FIDESlib::CKKS::KeySwitchingKey key(c);key.Initialize(raw);
+        this->residency_upload_bytes+=key.getMemoryUsage();++this->residency_loads;
+        c->AddRotationKey(step,std::move(key));
+    }
+    if(bootstrapSlots)FIDESlib::CKKS::AddBootstrapPrecomputation(pk,bootstrapSlots,c,false);
+    this->Synchronize();
+    this->residency_phase_rotations=rotations;this->residency_phase_slots=bootstrapSlots;
+    this->residency_phase_initialized=true;
+}
+
+std::map<std::string,uint64_t> CryptoContextImpl<DCRTPoly>::GetKeyResidencyStats() const {
+    std::map<std::string,uint64_t> out{{"loads",residency_loads},{"evictions",residency_evictions},
+        {"uploaded_device_key_bytes",residency_upload_bytes},{"resident_rotation_keys",0},{"resident_key_bytes",0}};
+    if(!loaded || devices.empty())return out;
+    const auto& c=std::any_cast<const FIDESlib::CKKS::Context&>(gpu);
+    for(const auto& entry:c->precom.keys) {
+        const auto& keys=entry.second;
+        if(keys.eval_key)out["resident_key_bytes"]+=keys.eval_key->getMemoryUsage();
+        out["resident_rotation_keys"]+=keys.rot_keys.size();
+        for(const auto& key:keys.rot_keys)out["resident_key_bytes"]+=key.second.getMemoryUsage();
+    }
+    return out;
+}
+
+bool CryptoContextImpl<DCRTPoly>::HasResidentRotationKey(int step) const {
+    if(!loaded || devices.empty() || !residency_public_key)return false;
+    const auto& c=std::any_cast<const FIDESlib::CKKS::Context&>(gpu);
+    const auto& pk=std::any_cast<const lbcrypto::PublicKey<lbcrypto::DCRTPoly>&>(residency_public_key->pimpl);
+    const auto& keys=c->precom.keys.at(pk->GetKeyTag()).rot_keys;
+    if(step!=2*c->N-1){int width=c->N/2;step=(step%width+width)%width;}
+    return keys.count(step)!=0;
 }
 
 void CryptoContextImpl<DCRTPoly>::LoadPlaintext(Plaintext& pt) {
@@ -1671,6 +1757,23 @@ void CryptoContextImpl<DCRTPoly>::EvalSquareInPlace(Ciphertext<DCRTPoly>& ct) {
 Ciphertext<DCRTPoly> CryptoContextImpl<DCRTPoly>::EvalSquareMutable(Ciphertext<DCRTPoly>& ct) {
     FIDESlib::CudaNvtxRange r("API" + std::string{ sc::current().function_name() });
     return EvalSquare(ct);
+}
+
+Ciphertext<DCRTPoly> CryptoContextImpl<DCRTPoly>::EvalConjugate(const Ciphertext<DCRTPoly>& ciphertext) {
+    if (this->devices.empty()) {
+        auto& context = std::any_cast<const lbcrypto::CryptoContext<lbcrypto::DCRTPoly>&>(this->cpu);
+        auto& source = std::any_cast<const lbcrypto::Ciphertext<lbcrypto::DCRTPoly>&>(ciphertext->cpu);
+        auto result = std::make_shared<CiphertextImpl<DCRTPoly>>(this->self_reference.lock());
+        result->cpu = std::make_any<lbcrypto::Ciphertext<lbcrypto::DCRTPoly>>(
+            lbcrypto::FHECKKSRNS::Conjugate(source, context->GetEvalAutomorphismKeyMap(source->GetKeyTag())));
+        return result;
+    }
+    this->LoadCiphertext(const_cast<Ciphertext<DCRTPoly>&>(ciphertext));
+    auto result = std::make_shared<CiphertextImpl<DCRTPoly>>(*ciphertext);
+    auto source_gpu = std::static_pointer_cast<FIDESlib::CKKS::Ciphertext>(this->GetDeviceCiphertext(ciphertext->gpu));
+    auto result_gpu = std::static_pointer_cast<FIDESlib::CKKS::Ciphertext>(this->GetDeviceCiphertext(result->gpu));
+    result_gpu->conjugate(*source_gpu);
+    return result;
 }
 
 Ciphertext<DCRTPoly> CryptoContextImpl<DCRTPoly>::EvalRotate(const Ciphertext<DCRTPoly>& ciphertext, int32_t index) {

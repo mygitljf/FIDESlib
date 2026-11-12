@@ -58,6 +58,13 @@ template <> class CryptoContextImpl<DCRTPoly> {
 
     /// @brief Load the context to the devices.
     void LoadContext(const PublicKey<DCRTPoly>& publicKey);
+    /// Opt-in, single-device UNIFORM_TERNARY key residency. Configure before LoadContext.
+    void SetKeyStreaming(bool enabled);
+    /// Synchronize, retain the requested rotation set and load missing public evaluation keys.
+    /// A nonzero bootstrapSlots selects that bootstrap's rotation set/precomputation too.
+    void PrepareKeyPhase(const std::vector<int>& rotations, uint32_t bootstrapSlots = 0);
+    std::map<std::string, uint64_t> GetKeyResidencyStats() const;
+    bool HasResidentRotationKey(int step) const;
     /// @brief Load a plaintext to the devices.
     /// @param pt Plaintext to load.
     void LoadPlaintext(Plaintext& pt);
@@ -167,6 +174,8 @@ template <> class CryptoContextImpl<DCRTPoly> {
     Ciphertext<DCRTPoly> EvalSquareMutable(Ciphertext<DCRTPoly>& ct);
 
     Ciphertext<DCRTPoly> EvalRotate(const Ciphertext<DCRTPoly>& ciphertext, int32_t index);
+    /// Complex conjugation using the context's existing automorphism key.
+    Ciphertext<DCRTPoly> EvalConjugate(const Ciphertext<DCRTPoly>& ciphertext);
     void EvalRotateInPlace(Ciphertext<DCRTPoly>& ciphertext, int32_t index);
 
     std::shared_ptr<void> EvalFastRotationPrecompute(const Ciphertext<DCRTPoly>& ct);
@@ -212,6 +221,12 @@ template <> class CryptoContextImpl<DCRTPoly> {
     std::any gpu;
     /// @brief Whether the context has been loaded to the devices.
     bool loaded = false;
+    bool key_streaming = false;
+    PublicKey<DCRTPoly> residency_public_key;
+    std::vector<int> residency_phase_rotations;
+    uint32_t residency_phase_slots = 0;
+    bool residency_phase_initialized = false;
+    uint64_t residency_loads = 0, residency_evictions = 0, residency_upload_bytes = 0;
     /// @brief List of devices the context is loaded on.
     std::vector<int> devices = { 0 };
     /// @brief Whether plaintexts should be automatically loaded to the device upon encryption.

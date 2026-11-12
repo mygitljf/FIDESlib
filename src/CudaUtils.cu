@@ -551,44 +551,28 @@ void* GPUmalloc(int id, int bytes, cudaStream_t stream, bool cache) {
     }
 #if MEMPOOL
     if (cache && (bytes & (bytes - 1)) == 0) {
-        std::vector<void*>& free_limb = size_to_memory[id][bytes];
-
-        if (s[id].ptr() == nullptr) {
-            mempool_lock[id].lock();
-            if (s[id].ptr() == nullptr) {
-                s[id].init();
-            }
-            mempool_lock[id].unlock();
-        }
+        // One transaction protects the map, empty check, slab allocation, shared
+        // stream event and pop. OpenMP key initialization may call this concurrently.
+        // Locking only push/pop allowed several threads to allocate a 1 GiB slab
+        // for the same empty bin, and raced on std::map and Stream::ev.
+        std::lock_guard<std::mutex> lock(mempool_lock[id]);
+        auto& free_limb = size_to_memory[id][bytes];
+        if (s[id].ptr() == nullptr) s[id].init();
         CudaCheckErrorModNoSync;
         if (free_limb.empty()) {
             uint64_t* base;
             cudaMallocAsync(&base, MBs * 1024 * 1024, s[id].ptr());
-
-            mempool_lock[id].lock();
-            for (uint32_t i = 0; i < MBs * 1024 * 1024; i += bytes) {
+            CudaCheckErrorModNoSync;
+            for (uint64_t i = 0; i < MBs * 1024 * 1024; i += bytes)
                 free_limb.emplace_back(((char*)base) + i);
-            }
-            // Keep the pool NVTX lifetime in sync with the memory actually reserved for this chunk size.
             NvtxPoolRecordSlab(id, bytes, MBs * 1024 * 1024);
-            mempool_lock[id].unlock();
         }
-        CudaCheckErrorModNoSync;
-
-        // if (stream != nullptr) {
         s[id].record();
         CudaCheckErrorModNoSync;
         cudaStreamWaitEvent(stream, s[id].ev);
-        //}
-
         CudaCheckErrorModNoSync;
-        mempool_lock[id].lock();
         ptr = free_limb.back();
         free_limb.pop_back();
-        mempool_lock[id].unlock();
-        // ptr = free_limb.front();
-        // free_limb.pop_front();
-        // std::cout << "get " << ptr << std::endl;
         return ptr;
     }
 
@@ -648,25 +632,17 @@ void GPUfree(void* ptr, int id, int bytes, cudaStream_t stream, bool cache) {
 
 #if MEMPOOL
     if (cache && (bytes & (bytes - 1)) == 0) {
-        std::vector<void*>& free_limb = size_to_memory[id][bytes];
-        if (s[id].ptr() == nullptr) {
-            mempool_lock[id].lock();
-            s[id].init();
-            mempool_lock[id].unlock();
-        }
+        std::lock_guard<std::mutex> lock(mempool_lock[id]);
+        auto& free_limb = size_to_memory[id][bytes];
+        if (s[id].ptr() == nullptr) s[id].init();
         CudaCheckErrorModNoSync;
-        // cudaDeviceSynchronize();
-        // if (stream != nullptr) {
-        if (!gpufree_presynced) // redundant while ContextData::clearAuxilarPoly holds the device synchronized
+        if (!gpufree_presynced)
             s[id].wait(stream);
-        //}
         CudaCheckErrorModNoSync;
-        mempool_lock[id].lock();
         free_limb.emplace_back(ptr);
-        mempool_lock[id].unlock();
-        // std::cout << "free " << ptr << std::endl;
         return;
     }
+
 #endif
 
     if (0) {

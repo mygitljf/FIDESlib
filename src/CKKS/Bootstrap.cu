@@ -23,6 +23,18 @@ using namespace FIDESlib::CKKS;
 
 constexpr bool PRINT = false;
 
+// Match OpenFHE's parameter-domain check before unsigned subtraction. Without
+// it, e.g. firstModSize=60/scaleModSize=50 with correctionFactor=9 wraps to
+// UINT32_MAX and eventually produces nonfinite bootstrap scaling factors.
+static uint32_t CheckedBootstrapCorrection(ContextData& cc, int slots, int32_t degree) {
+    const auto factor = cc.GetBootPrecomputation(slots).correctionFactor;
+    if (degree > static_cast<int32_t>(factor))
+        throw std::invalid_argument("Bootstrap first-modulus/scaling-modulus gap exceeds correction factor: " +
+                                    std::to_string(degree) + " > " + std::to_string(factor));
+    return factor - degree;
+}
+
+
 void FIDESlib::CKKS::BootstrapCPUraise(Ciphertext& ctxt,
     const int slots,
     std::shared_ptr<lbcrypto::CryptoContextImpl<lbcrypto::DCRTPolyImpl<bigintdyn::mubintvec<bigintdyn::ubint<expdtype>>>>>& CPUcc,
@@ -59,7 +71,7 @@ void FIDESlib::CKKS::BootstrapCPUraise(Ciphertext& ctxt,
     }
 #endif
     */
-    uint32_t correction = cc.GetBootPrecomputation(slots).correctionFactor - deg;
+    uint32_t correction = CheckedBootstrapCorrection(cc, slots, deg);
     if constexpr (PRINT)
         std::cout << cc.GetBootPrecomputation(slots).correctionFactor << " " << deg << std::endl;
     double post = std::pow(2, static_cast<double>(deg));
@@ -222,7 +234,7 @@ static void BootstrapSingle(Ciphertext& ctxt, const int slots, const bool presca
     }
 #endif
     */
-    uint32_t correction = cc.GetBootPrecomputation(slots).correctionFactor - deg;
+    uint32_t correction = CheckedBootstrapCorrection(cc, slots, deg);
     if constexpr (PRINT)
         std::cout << cc.GetBootPrecomputation(slots).correctionFactor << " " << deg << std::endl;
     double post = std::pow(2, static_cast<double>(deg));
@@ -537,7 +549,7 @@ static void BootstrapStCSingle(Ciphertext& ctxt, const int slots, const bool pre
     const auto p = cc.param.raw->p; // cryptoParams->GetPlaintextModulus();
     double powP = pow(2, p);
     int32_t deg = std::round(std::log2(qDouble / powP));
-    uint32_t correction = cc.GetBootPrecomputation(slots).correctionFactor - deg;
+    uint32_t correction = CheckedBootstrapCorrection(cc, slots, deg);
     double post = std::pow(2, static_cast<double>(deg));
     double pre = 1. / post;
     uint64_t scalar = std::llround(post);
@@ -711,7 +723,7 @@ double FIDESlib::CKKS::GetPreScaleFactor(Context& cc_, int slots) {
         }
     #endif
         */
-    uint32_t correction = cc.GetBootPrecomputation(slots).correctionFactor - deg;
+    uint32_t correction = CheckedBootstrapCorrection(cc, slots, deg);
 
     double res = 0.0;
     if (cc.rescaleTechnique == CKKS::FLEXIBLEAUTO || cc.rescaleTechnique == CKKS::FLEXIBLEAUTOEXT) {
