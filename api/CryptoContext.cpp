@@ -279,15 +279,16 @@ void CryptoContextImpl<DCRTPoly>::PrepareKeyPhase(const std::vector<int>& rotati
     if (!this->key_streaming) return;
     if (!this->loaded || !this->residency_public_key)
         OPENFHE_THROW("PrepareKeyPhase requires a loaded context");
-    if (this->residency_phase_initialized && this->residency_phase_slots == bootstrapSlots &&
-        this->residency_phase_rotations == rotations) return;
-    this->Synchronize(); // No queued kernel may retain a reference to an evicted key.
     auto& context = std::any_cast<lbcrypto::CryptoContext<lbcrypto::DCRTPoly>&>(this->cpu);
     auto& c = std::any_cast<FIDESlib::CKKS::Context&>(this->gpu);
     auto& pk = std::any_cast<const lbcrypto::PublicKey<lbcrypto::DCRTPoly>&>(this->residency_public_key->pimpl);
     std::set<int> keep;
     auto normalize = [&](int step) { const int width=c->N/2; return (step%width+width)%width; };
     for (int step:rotations) if(step) keep.insert(normalize(step));
+    keep.erase(0);
+    const std::vector<int> canonical(keep.begin(),keep.end());
+    if (this->residency_phase_initialized && this->residency_phase_slots == bootstrapSlots &&
+        this->residency_phase_rotations == canonical) return;
     if (bootstrapSlots) {
         if (std::find(this->slots_bootstrap.begin(),this->slots_bootstrap.end(),bootstrapSlots)==this->slots_bootstrap.end())
             OPENFHE_THROW("Requested bootstrap has not been prepared on the host");
@@ -302,6 +303,7 @@ void CryptoContextImpl<DCRTPoly>::PrepareKeyPhase(const std::vector<int>& rotati
         uint32_t index=step==conjugation?conjugation:FIDESlib::modpow(5,step,2*c->N);
         if(!hostKeys.count(index)) OPENFHE_THROW("Requested rotation is absent from the host evaluation-key set");
     }
+    this->Synchronize(); // No queued kernel may retain a reference to an evicted key.
     auto& keys=c->precom.keys.at(pk->GetKeyTag()).rot_keys;
     for(auto it=keys.begin();it!=keys.end();) {
         if(!keep.count(it->first)){it=keys.erase(it);++this->residency_evictions;}
@@ -319,7 +321,7 @@ void CryptoContextImpl<DCRTPoly>::PrepareKeyPhase(const std::vector<int>& rotati
     }
     if(bootstrapSlots)FIDESlib::CKKS::AddBootstrapPrecomputation(pk,bootstrapSlots,c,false);
     this->Synchronize();
-    this->residency_phase_rotations=rotations;this->residency_phase_slots=bootstrapSlots;
+    this->residency_phase_rotations=canonical;this->residency_phase_slots=bootstrapSlots;
     this->residency_phase_initialized=true;
 }
 
