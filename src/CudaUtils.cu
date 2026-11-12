@@ -534,11 +534,17 @@ FIDESlib::Stream s[MAXG];
 
 #define MEMPOOL true
 
+#ifndef FIDESLIB_GPU_POOL_SLAB_MIB
+#define FIDESLIB_GPU_POOL_SLAB_MIB 1024
+#endif
+static_assert(FIDESLIB_GPU_POOL_SLAB_MIB > 0 && FIDESLIB_GPU_POOL_SLAB_MIB <= 1024 &&
+              (FIDESLIB_GPU_POOL_SLAB_MIB & (FIDESLIB_GPU_POOL_SLAB_MIB - 1)) == 0);
+
 // void* GPUmalloc(int id, int bytes, cudaStream_t stream, FIDESlib::CKKS::Context& cc) {
 void* GPUmalloc(int id, int bytes, cudaStream_t stream, bool cache) {
     void* ptr = nullptr;
 
-    uint64_t MBs = 1024;
+    uint64_t MBs = FIDESLIB_GPU_POOL_SLAB_MIB;
 
     if (bytes < 64 * 1024) {
         int next_pow2 = 1024;
@@ -561,11 +567,12 @@ void* GPUmalloc(int id, int bytes, cudaStream_t stream, bool cache) {
         CudaCheckErrorModNoSync;
         if (free_limb.empty()) {
             uint64_t* base;
-            cudaMallocAsync(&base, MBs * 1024 * 1024, s[id].ptr());
+            const uint64_t slabBytes = std::max(MBs * 1024 * 1024, uint64_t(bytes));
+            cudaMallocAsync(&base, slabBytes, s[id].ptr());
             CudaCheckErrorModNoSync;
-            for (uint64_t i = 0; i < MBs * 1024 * 1024; i += bytes)
+            for (uint64_t i = 0; i < slabBytes; i += bytes)
                 free_limb.emplace_back(((char*)base) + i);
-            NvtxPoolRecordSlab(id, bytes, MBs * 1024 * 1024);
+            NvtxPoolRecordSlab(id, bytes, slabBytes);
         }
         s[id].record();
         CudaCheckErrorModNoSync;

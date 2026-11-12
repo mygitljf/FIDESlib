@@ -40,6 +40,16 @@ option(FIDESLIB_COMPILE_BENCHMARKS "Set ON to compile the FIDESlib benchmark sui
 # Option to compile the test suite.
 option(FIDESLIB_COMPILE_TESTS "Set ON to compile the FIDESlib test suite." ON)
 
+set(FIDESLIB_GPU_POOL_SLAB_MIB "1024" CACHE STRING "GPU pool growth in MiB (power of two, 1..1024).")
+if (NOT FIDESLIB_GPU_POOL_SLAB_MIB MATCHES "^[1-9][0-9]*$" OR
+    FIDESLIB_GPU_POOL_SLAB_MIB LESS 1 OR FIDESLIB_GPU_POOL_SLAB_MIB GREATER 1024)
+    message(FATAL_ERROR "FIDESLIB_GPU_POOL_SLAB_MIB must be a power of two from 1 to 1024")
+endif ()
+math(EXPR _fideslib_pool_slab_remainder "${FIDESLIB_GPU_POOL_SLAB_MIB} & (${FIDESLIB_GPU_POOL_SLAB_MIB} - 1)")
+if (NOT _fideslib_pool_slab_remainder EQUAL 0)
+    message(FATAL_ERROR "FIDESLIB_GPU_POOL_SLAB_MIB must be a power of two from 1 to 1024")
+endif ()
+
 # Option to build with gcov coverage instrumentation. Forces a Debug build (coverage needs -O0 and is
 # incompatible with the IPO/LTO used in Release) and appends `--coverage` to the C++/C and linker
 # flags. nvcc forwards `--coverage` to its host-compiler pass, so host-side code in both .cpp and .cu
@@ -320,6 +330,7 @@ file(GLOB_RECURSE HEADER_FILES_PUBLIC ${API_DIR}/*.hpp)
 set_source_files_properties(${HEADER_FILES_PUBLIC} ${SOURCE_FILES_API} PROPERTIES LANGUAGE CXX)
 
 add_library(fideslib STATIC)
+target_compile_definitions(fideslib PRIVATE FIDESLIB_GPU_POOL_SLAB_MIB=${FIDESLIB_GPU_POOL_SLAB_MIB})
 
 target_sources(fideslib PRIVATE ${SOURCE_FILES_CXX} ${SOURCE_FILES_CUDA} ${SOURCE_FILES_API})
 target_sources(fideslib PRIVATE
